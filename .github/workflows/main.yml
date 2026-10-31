@@ -1,0 +1,324 @@
+
+name: PCYBER Windows 2022 + Tailscale + Downloads.bat
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_downloads:
+        description: "Download and execute Downloads.bat"
+        required: true
+        type: boolean
+        default: true
+
+      downloads_bat_url:
+        description: "Direct GitLab URL of Downloads.bat"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  secure-rdp:
+    name: Windows 2022 Secure RDP
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    env:
+      RDP_USER: pcyberrdp
+
+    steps:
+      - name: Check Windows and Hardware
+        shell: pwsh
+        run: |
+          Write-Host "===== WINDOWS INFORMATION ====="
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture
+
+          Write-Host "===== CPU INFORMATION ====="
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
+
+          Write-Host "===== MEMORY INFORMATION ====="
+          $memory = Get-CimInstance Win32_ComputerSystem
+          $ramGB = [math]::Round($memory.TotalPhysicalMemory / 1GB, 2)
+          Write-Host "Available physical RAM: $ramGB GB"
+
+          Write-Host "===== DISK INFORMATION ====="
+          Get-PSDrive -PSProvider FileSystem |
+            Select-Object Name,
+              @{Name="UsedGB";Expression={[math]::Round($_.Used / 1GB, 2)}},
+              @{Name="FreeGB";Expression={[math]::Round($_.Free / 1GB, 2)}}
+
+      - name: Validate GitHub Secrets
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Missing GitHub Secret: RDP_PASSWORD"
+          }
+
+          if ($env:RDP_PASSWORD.Length -lt 12) {
+            throw "RDP_PASSWORD must contain at least 12 characters."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            throw "Missing GitHub Secret: TAILSCALE_AUTHKEY"
+          }
+
+          Write-Host "Required secrets are configured."
+
+      - name: Configure Secure RDP
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Creating RDP account..."
+
+          $securePassword = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          $existingUser = Get-LocalUser -Name $env:RDP_USER `
+            -ErrorAction SilentlyContinue
+
+          if ($existingUser) {
+            Set-LocalUser -Name $env:RDP_USER `
+              -Password $securePassword
+          }
+          else {
+            New-LocalUser `
+              -Name $env:RDP_USER `
+              -Password $securePassword `
+              -Description "PCYBER Tailscale RDP Account" `
+              -PasswordNeverExpires
+          }
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member $env:RDP_USER `
+            -ErrorAction SilentlyContinue
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $env:RDP_USER `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Enabling Remote Desktop..."
+
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          $rdpPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+
+          Set-ItemProperty -Path $rdpPath `
+            -Name "UserAuthentication" -Value 1
+
+          Set-ItemProperty -Path $rdpPath `
+            -Name "SecurityLayer" -Value 2
+
+          Set-ItemProperty -Path $rdpPath `
+            -Name "MinEncryptionLevel" -Value 3
+
+          Write-Host "Configuring RDP firewall..."
+
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" |
+            Disable-NetFirewallRule
+
+          New-NetFirewallRule `
+            -DisplayName "PCYBER RDP - Tailscale Only" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -Action Allow `
+            -RemoteAddress "100.64.0.0/10" `
+            -Profile Any
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          Write-Host "Secure RDP configuration completed."
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installer = "$env:TEMP\tailscale-setup.msi"
+
+          Write-Host "Downloading Tailscale..."
+
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $installer
+
+          Write-Host "Installing Tailscale..."
+
+          $process = Start-Process msiexec.exe `
+            -ArgumentList "/i `"$installer`" /qn /norestart" `
+            -Wait -PassThru
+
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "Tailscale installation failed: $($process.ExitCode)"
+          }
+
+          Remove-Item $installer -Force
+
+          Write-Host "Tailscale installation completed."
+
+      - name: Connect to Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (!(Test-Path $tailscale)) {
+            throw "Tailscale executable not found."
+          }
+
+          Write-Host "Connecting to Tailscale..."
+
+          & $tailscale up `
+            --authkey=$env:TAILSCALE_AUTHKEY `
+            --hostname="pcyber-rdp-${{ github.run_id }}" `
+            --accept-dns=true
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale connection failed."
+          }
+
+          Write-Host "Tailscale connection established."
+
+          Start-Sleep -Seconds 10
+
+          Write-Host "===== TAILSCALE STATUS ====="
+          & $tailscale status
+
+          Write-Host "===== TAILSCALE IP ====="
+          $ip = & $tailscale ip -4
+
+          if (!$ip) {
+            throw "Could not obtain Tailscale IPv4 address."
+          }
+
+          Write-Host "RDP ADDRESS: ${ip}:3389"
+
+          "RDP_ADDRESS=$ip" >> $env:GITHUB_ENV
+
+      - name: Verify RDP and Hardware
+        shell: pwsh
+        run: |
+          Write-Host "===== RDP CONFIGURATION ====="
+
+          Get-ItemProperty `
+            "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" |
+            Select-Object fDenyTSConnections
+
+          Write-Host "===== RDP SERVICE ====="
+          Get-Service TermService
+
+          Write-Host "===== RDP FIREWALL ====="
+          Get-NetFirewallRule `
+            -DisplayName "PCYBER RDP - Tailscale Only" |
+            Format-List DisplayName, Enabled, Direction, Action
+
+          Write-Host "===== MEMORY ====="
+          $ram = Get-CimInstance Win32_ComputerSystem
+          Write-Host "Total RAM: $([math]::Round($ram.TotalPhysicalMemory / 1GB, 2)) GB"
+
+          Write-Host "===== RDP CONNECTION DETAILS ====="
+          Write-Host "Address: $env:RDP_ADDRESS"
+          Write-Host "Username: $env:RDP_USER"
+
+      - name: Download Downloads.bat
+        if: ${{ inputs.run_downloads }}
+        shell: pwsh
+        env:
+          DOWNLOADS_BAT_URL: ${{ inputs.downloads_bat_url }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:DOWNLOADS_BAT_URL)) {
+            throw "Provide the direct GitLab Downloads.bat URL."
+          }
+
+          $destination = "$env:USERPROFILE\Downloads\Downloads.bat"
+
+          New-Item -ItemType Directory `
+            -Path (Split-Path $destination) `
+            -Force | Out-Null
+
+          Write-Host "Downloading Downloads.bat..."
+
+          Invoke-WebRequest `
+            -Uri $env:DOWNLOADS_BAT_URL `
+            -OutFile $destination
+
+          if (!(Test-Path $destination)) {
+            throw "Downloads.bat download failed."
+          }
+
+          Write-Host "Downloads.bat downloaded successfully."
+          Write-Host "Location: $destination"
+
+          Write-Host "Executing Downloads.bat..."
+
+          $process = Start-Process `
+            -FilePath "cmd.exe" `
+            -ArgumentList "/c `"$destination`"" `
+            -Wait `
+            -PassThru
+
+          Write-Host "Downloads.bat exit code: $($process.ExitCode)"
+
+          if ($process.ExitCode -ne 0) {
+            throw "Downloads.bat execution failed."
+          }
+
+      - name: Keep RDP Session Alive
+        shell: pwsh
+        run: |
+          Write-Host "======================================"
+          Write-Host "PCYBER WINDOWS RDP IS READY"
+          Write-Host "======================================"
+
+          Write-Host "RDP Address: $env:RDP_ADDRESS"
+          Write-Host "RDP Port: 3389"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Timeout: 360 minutes"
+          Write-Host "======================================"
+
+          $startTime = Get-Date
+
+          while ($true) {
+            $elapsed = (Get-Date) - $startTime
+            $remaining = 360 - $elapsed.TotalMinutes
+
+            if ($remaining -le 0) {
+              Write-Host "Maximum workflow duration reached."
+              break
+            }
+
+            Write-Host "RDP ACTIVE | Elapsed: $([math]::Round($elapsed.TotalMinutes, 1)) minutes | Remaining: $([math]::Round($remaining, 1)) minutes"
+
+            Start-Sleep -Seconds 60
+
+            $service = Get-Service TermService
+
+            if ($service.Status -ne "Running") {
+              Start-Service TermService
+            }
+
+            $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+            & $tailscale status | Out-Null
+
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "Tailscale status check failed."
+            }
+          }
