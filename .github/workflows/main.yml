@@ -3,20 +3,10 @@ name: win 11 + tailscale + PCYBER Application + Downloads.bat
 
 on:
   workflow_dispatch:
-    inputs:
-      runner_label:
-        description: "Select the Windows runner"
-        required: true
-        type: choice
-        default: pcyber-windows-128gb
-        options:
-          - pcyber-windows-128gb
-          - windows-2025
-          - windows-2022
 
 jobs:
   secure-rdp:
-    runs-on: ${{ inputs.runner_label }}
+    runs-on: windows-2022
     timeout-minutes: 360
 
     env:
@@ -27,28 +17,36 @@ jobs:
       DOWNLOADS_BAT_URL: https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat
 
     steps:
+
+      # ==========================================
+      # 1. WINDOWS RUNNER INFORMATION
+      # ==========================================
+
       - name: Display Windows Runner Information
         shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
+
           Write-Host "========================================"
           Write-Host "PCYBER WINDOWS RDP RUNNER"
           Write-Host "========================================"
 
-          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture
+          Get-ComputerInfo |
+            Select-Object WindowsProductName, WindowsVersion, OsArchitecture
 
           $ram = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
           $ramGB = [math]::Round($ram / 1GB, 2)
 
           Write-Host "Available RAM: $ramGB GB"
-          Write-Host "Selected runner: ${{ inputs.runner_label }}"
+          Write-Host "Runner: windows-2022"
 
           if ($ramGB -lt 15.5) {
-            Write-Warning "This runner has less than 16 GB RAM."
+            Write-Warning "Runner has less than the expected 16 GB RAM."
           }
 
-          if ("${{ inputs.runner_label }}" -eq "pcyber-windows-128gb" -and $ramGB -lt 120) {
-            Write-Warning "The selected runner did not provide approximately 128 GB RAM."
-          }
+      # ==========================================
+      # 2. VALIDATE SECRETS
+      # ==========================================
 
       - name: Validate Required Secrets
         shell: powershell
@@ -67,6 +65,10 @@ jobs:
           }
 
           Write-Host "Required secrets are available."
+
+      # ==========================================
+      # 3. CREATE RDP USER
+      # ==========================================
 
       - name: Create RDP User
         shell: powershell
@@ -96,6 +98,10 @@ jobs:
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
 
           Write-Host "RDP user configured."
+
+      # ==========================================
+      # 4. CONFIGURE REMOTE DESKTOP
+      # ==========================================
 
       - name: Enable and Configure Remote Desktop
         shell: powershell
@@ -139,6 +145,10 @@ jobs:
 
           Write-Host "Remote Desktop configured."
 
+      # ==========================================
+      # 5. INSTALL TAILSCALE
+      # ==========================================
+
       - name: Install Tailscale
         shell: powershell
         run: |
@@ -161,16 +171,20 @@ jobs:
             -PassThru
 
           if ($process.ExitCode -notin @(0, 3010)) {
-            throw "Tailscale installation failed with exit code $($process.ExitCode)"
+            throw "Tailscale installation failed: $($process.ExitCode)"
           }
 
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
           if (!(Test-Path $tailscale)) {
-            throw "Tailscale executable was not found after installation."
+            throw "Tailscale executable not found."
           }
 
           Write-Host "Tailscale installed successfully."
+
+      # ==========================================
+      # 6. CONNECT TAILSCALE
+      # ==========================================
 
       - name: Connect to Tailscale
         shell: powershell
@@ -202,6 +216,7 @@ jobs:
 
             if ($status) {
               $tailscaleIP = ($status | Select-Object -First 1).Trim()
+
               if ($tailscaleIP -match '^100\.') {
                 break
               }
@@ -214,13 +229,18 @@ jobs:
             throw "Could not obtain a valid Tailscale IPv4 address."
           }
 
-          "TAILSCALE_IP=$tailscaleIP" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "TAILSCALE_IP=$tailscaleIP" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
 
           Write-Host "========================================"
           Write-Host "TAILSCALE CONNECTED"
           Write-Host "Tailscale IP: $tailscaleIP"
           Write-Host "RDP Port: 3389"
           Write-Host "========================================"
+
+      # ==========================================
+      # 7. TEST RDP
+      # ==========================================
 
       - name: Test RDP Connection
         shell: powershell
@@ -251,6 +271,10 @@ jobs:
           }
 
           Write-Host "RDP port is reachable."
+
+      # ==========================================
+      # 8. DOWNLOAD PCYBER EXE FROM GITHUB
+      # ==========================================
 
       - name: Download PCYBER Application from GitHub Releases
         shell: powershell
@@ -293,10 +317,14 @@ jobs:
           Write-Host "Downloaded SHA256: $hash"
 
           if ($hash -ne $env:APP_SHA256) {
-            throw "SHA256 verification failed. The downloaded file does not match the GitHub release."
+            throw "SHA256 verification failed."
           }
 
           Write-Host "Download and integrity verification successful."
+
+      # ==========================================
+      # 9. INSTALL PCYBER APPLICATION
+      # ==========================================
 
       - name: Install PCYBER Application
         shell: powershell
@@ -325,16 +353,21 @@ jobs:
 
           Write-Host "PCYBER application installation completed."
 
+      # ==========================================
+      # 10. DOWNLOAD DOWNLOADS.BAT
+      # ==========================================
+
       - name: Download Downloads.bat and Configure Startup
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          $startupPath = "C:\Users\$env:RDP_USERNAME\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+          $profilePath = "C:\Users\$env:RDP_USERNAME"
+
+          $startupPath = Join-Path $profilePath `
+            "AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
 
           Write-Host "Waiting for RDP user profile..."
-
-          $profilePath = "C:\Users\$env:RDP_USERNAME"
 
           for ($i = 1; $i -le 60; $i++) {
             if (Test-Path $profilePath) {
@@ -344,13 +377,8 @@ jobs:
             Start-Sleep -Seconds 5
           }
 
-          if (!(Test-Path $profilePath)) {
-            Write-Host "RDP profile has not been created yet. Creating startup directory."
-            New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
-          }
-          else {
-            New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
-          }
+          New-Item -ItemType Directory -Path $startupPath -Force |
+            Out-Null
 
           $batPath = Join-Path $startupPath "Downloads.bat"
 
@@ -369,8 +397,11 @@ jobs:
             throw "Downloads.bat appears to be empty."
           }
 
-          Write-Host "Downloads.bat successfully placed in the RDP startup folder."
-          Write-Host $batPath
+          Write-Host "Downloads.bat successfully placed in startup folder."
+
+      # ==========================================
+      # 11. DISPLAY CONNECTION DETAILS
+      # ==========================================
 
       - name: Display RDP Connection Details
         shell: powershell
@@ -386,17 +417,23 @@ jobs:
           Write-Host "PASSWORD    : Your configured RDP_PASSWORD secret"
           Write-Host ""
           Write-Host "Connect using Windows Remote Desktop (mstsc.exe)."
-          Write-Host "Make sure your client device is connected to the same Tailscale network."
+          Write-Host "Your client device must also be connected to Tailscale."
           Write-Host ""
           Write-Host "=============================================="
 
-      - name: Keep RDP Runner Alive for 360 Minutes
+      # ==========================================
+      # 12. KEEP RDP ALIVE
+      # ==========================================
+
+      - name: Keep RDP Runner Alive for 350 Minutes
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
 
           Write-Host "=============================================="
           Write-Host "PCYBER RDP SESSION IS RUNNING"
+          Write-Host "Runner: windows-2022"
+          Write-Host "Expected RAM: approximately 16 GB"
           Write-Host "Maximum workflow timeout: 360 minutes"
           Write-Host "=============================================="
 
@@ -415,9 +452,7 @@ jobs:
             $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
             if (Test-Path $tailscale) {
-              $status = & $tailscale status 2>&1
-              Write-Host "Tailscale status:"
-              Write-Host $status
+              & $tailscale status
             }
 
             Write-Host "RDP service status:"
