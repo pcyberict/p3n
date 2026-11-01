@@ -1,5 +1,5 @@
 
-name: win 11 + tailscale + PCYBER Application + Downloads.bat
+name: win 11 + tailscale + PCYBER Application + Download.bat
 
 on:
   workflow_dispatch:
@@ -9,336 +9,323 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 360
 
-    env:
-      RDP_USERNAME: RDP
-      APP_URL: https://github.com/pcyberict/pcyber-rdp-apps/releases/download/v1.0/pbot.exe
-      APP_SHA256: 32b69e5102b90d77d521cdd8404511ad1dc031a77c450cf5c80811bc0164cee8
-      TAILSCALE_MSI_URL: https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi
-      DOWNLOADS_BAT_URL: https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat
-
     steps:
 
       # ==========================================
-      # 1. WINDOWS RUNNER INFORMATION
+      # 1. CHECK WINDOWS, CPU, RAM AND STORAGE
       # ==========================================
 
-      - name: Display Windows Runner Information
-        shell: powershell
+      - name: Check Windows and Available RAM
+        shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          Write-Host "===== WINDOWS INFORMATION ====="
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture
 
-          Write-Host "========================================"
-          Write-Host "PCYBER WINDOWS RDP RUNNER"
-          Write-Host "========================================"
+          Write-Host "===== CPU INFORMATION ====="
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
 
-          Get-ComputerInfo |
-            Select-Object WindowsProductName, WindowsVersion, OsArchitecture
-
-          $ram = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
-          $ramGB = [math]::Round($ram / 1GB, 2)
+          Write-Host "===== RAM INFORMATION ====="
+          $computer = Get-CimInstance Win32_ComputerSystem
+          $ramGB = [math]::Round($computer.TotalPhysicalMemory / 1GB, 2)
 
           Write-Host "Available RAM: $ramGB GB"
-          Write-Host "Runner: windows-2022"
+          Write-Host "Requested RAM: 16 GB"
 
-          if ($ramGB -lt 15.5) {
+          if ($ramGB -ge 15.5) {
+            Write-Host "Expected 16 GB RAM configuration satisfied."
+          }
+          else {
             Write-Warning "Runner has less than the expected 16 GB RAM."
           }
 
+          Write-Host "===== STORAGE ====="
+          Get-PSDrive -PSProvider FileSystem |
+            Select-Object Name,
+              @{Name="FreeGB";Expression={[math]::Round($_.Free / 1GB, 2)}}
+
       # ==========================================
-      # 2. VALIDATE SECRETS
+      # 2. CONFIGURE CORE RDP SETTINGS
       # ==========================================
 
-      - name: Validate Required Secrets
-        shell: powershell
-        env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      - name: Configure Core RDP Settings
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
-            throw "Missing GitHub secret: TAILSCALE_AUTHKEY"
-          }
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" `
+            -Value 0 -Force
 
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            throw "Missing GitHub secret: RDP_PASSWORD"
-          }
+          # Enable Network Level Authentication
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" `
+            -Value 1 -Force
 
-          Write-Host "Required secrets are available."
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" `
+            -Value 2 -Force
+
+          # Remove previous custom firewall rule
+          Remove-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue
+
+          # Allow RDP only from Tailscale addresses
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tailscale" `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Profile Any
+
+          Set-Service -Name TermService -StartupType Automatic
+          Restart-Service -Name TermService -Force
+
+          Write-Host "Core RDP settings configured."
 
       # ==========================================
       # 3. CREATE RDP USER
       # ==========================================
 
-      - name: Create RDP User
-        shell: powershell
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      - name: Create RDP User with Fixed Password
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          # Use a strong password and rotate this example
+          # before using the workflow.
+          $password = "MR.English2008"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          $existingUser = Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
-
-          if ($existingUser) {
-            Set-LocalUser -Name $env:RDP_USERNAME -Password $securePassword
-            Enable-LocalUser -Name $env:RDP_USERNAME
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser `
+                -Name "RDP" `
+                -Password $securePass `
+                -PasswordNeverExpires `
+                -AccountNeverExpires `
+                -Description "PCYBER Remote Desktop User"
           }
           else {
-            New-LocalUser `
-              -Name $env:RDP_USERNAME `
-              -Password $securePassword `
-              -PasswordNeverExpires `
-              -AccountNeverExpires `
-              -Description "PCYBER Remote Desktop User"
+              Set-LocalUser -Name "RDP" -Password $securePass
+              Enable-LocalUser -Name "RDP"
           }
 
-          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
 
-          Write-Host "RDP user configured."
+          if (-not (Get-LocalUser -Name "RDP")) {
+              throw "RDP user creation failed."
+          }
 
-      # ==========================================
-      # 4. CONFIGURE REMOTE DESKTOP
-      # ==========================================
-
-      - name: Enable and Configure Remote Desktop
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          Set-ItemProperty `
-            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" `
-            -Value 0
-
-          Set-ItemProperty `
-            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-            -Name "UserAuthentication" `
-            -Value 1
-
-          Set-ItemProperty `
-            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-            -Name "SecurityLayer" `
-            -Value 2
-
-          Set-Service -Name TermService -StartupType Automatic
-
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
-
-          Get-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue |
-            Disable-NetFirewallRule
-
-          Remove-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue
-
-          New-NetFirewallRule `
-            -DisplayName "RDP-Tailscale" `
-            -Direction Inbound `
-            -Protocol TCP `
-            -LocalPort 3389 `
-            -RemoteAddress "100.64.0.0/10" `
-            -Action Allow `
-            -Profile Any
-
-          Restart-Service TermService -Force
-
-          Write-Host "Remote Desktop configured."
+          Write-Host "RDP user created successfully."
+          Write-Host "Username: RDP"
 
       # ==========================================
-      # 5. INSTALL TAILSCALE
+      # 4. INSTALL TAILSCALE
       # ==========================================
 
       - name: Install Tailscale
-        shell: powershell
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $installer = "$env:TEMP\tailscale-setup.msi"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
 
           Write-Host "Downloading Tailscale..."
 
           Invoke-WebRequest `
-            -Uri $env:TAILSCALE_MSI_URL `
-            -OutFile $installer `
-            -UseBasicParsing
+            -Uri $tsUrl `
+            -OutFile $installerPath
 
           Write-Host "Installing Tailscale..."
 
           $process = Start-Process msiexec.exe `
-            -ArgumentList "/i `"$installer`" /qn /norestart" `
-            -Wait `
-            -PassThru
+            -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
+            -Wait -PassThru
 
           if ($process.ExitCode -notin @(0, 3010)) {
-            throw "Tailscale installation failed: $($process.ExitCode)"
+              throw "Tailscale installation failed. Exit code: $($process.ExitCode)"
           }
 
-          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
 
-          if (!(Test-Path $tailscale)) {
-            throw "Tailscale executable not found."
+          if (-not (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
+              throw "Tailscale executable was not found."
           }
 
           Write-Host "Tailscale installed successfully."
 
       # ==========================================
-      # 6. CONNECT TAILSCALE
+      # 5. ESTABLISH TAILSCALE CONNECTION
       # ==========================================
 
-      - name: Connect to Tailscale
-        shell: powershell
+      - name: Establish Tailscale Connection
+        shell: pwsh
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
           $ErrorActionPreference = "Stop"
 
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+              throw "TAILSCALE_AUTHKEY is missing. Add it under repository Settings > Secrets and variables > Actions."
+          }
+
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
 
           Write-Host "Connecting to Tailscale..."
 
           & $tailscale up `
             --authkey="$env:TAILSCALE_AUTHKEY" `
-            --hostname="$hostname" `
+            --hostname="gh-runner-$env:GITHUB_RUN_ID" `
             --accept-dns=true
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Tailscale connection failed."
+              throw "Tailscale connection failed."
           }
 
-          $tailscaleIP = $null
+          # Wait for Tailscale IP
+          $tsIP = $null
 
-          for ($i = 1; $i -le 30; $i++) {
-            Start-Sleep -Seconds 5
+          for ($retries = 1; $retries -le 30; $retries++) {
+              $result = & $tailscale ip -4 2>$null
 
-            $status = & $tailscale ip -4 2>$null
-
-            if ($status) {
-              $tailscaleIP = ($status | Select-Object -First 1).Trim()
-
-              if ($tailscaleIP -match '^100\.') {
-                break
+              if ($result) {
+                  $tsIP = ($result | Select-Object -First 1).Trim()
               }
-            }
 
-            Write-Host "Waiting for Tailscale IP... Attempt $i"
+              if ($tsIP -match '^100\.') {
+                  break
+              }
+
+              Write-Host "Waiting for Tailscale IP... Attempt $retries"
+              Start-Sleep -Seconds 5
           }
 
-          if (!$tailscaleIP -or $tailscaleIP -notmatch '^100\.') {
-            throw "Could not obtain a valid Tailscale IPv4 address."
+          if (-not $tsIP -or $tsIP -notmatch '^100\.') {
+              throw "Tailscale IP not assigned."
           }
 
-          "TAILSCALE_IP=$tailscaleIP" |
-            Out-File -FilePath $env:GITHUB_ENV -Append
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-          Write-Host "========================================"
-          Write-Host "TAILSCALE CONNECTED"
-          Write-Host "Tailscale IP: $tailscaleIP"
-          Write-Host "RDP Port: 3389"
-          Write-Host "========================================"
+          Write-Host "Tailscale connected successfully."
+          Write-Host "Tailscale IP: $tsIP"
 
       # ==========================================
-      # 7. TEST RDP
+      # 6. VERIFY RDP ACCESSIBILITY
       # ==========================================
 
-      - name: Test RDP Connection
-        shell: powershell
+      - name: Verify RDP Accessibility
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "Testing RDP port..."
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+          Start-Sleep -Seconds 10
 
           $connected = $false
 
-          for ($i = 1; $i -le 20; $i++) {
-            $result = Test-NetConnection `
-              -ComputerName $env:TAILSCALE_IP `
-              -Port 3389 `
-              -WarningAction SilentlyContinue
+          for ($i = 1; $i -le 10; $i++) {
+              $testResult = Test-NetConnection `
+                -ComputerName $env:TAILSCALE_IP `
+                -Port 3389 `
+                -WarningAction SilentlyContinue
 
-            if ($result.TcpTestSucceeded) {
-              $connected = $true
-              break
-            }
+              if ($testResult.TcpTestSucceeded) {
+                  $connected = $true
+                  break
+              }
 
-            Write-Host "Waiting for RDP service... Attempt $i"
-            Start-Sleep -Seconds 5
+              Write-Host "Waiting for RDP... Attempt $i"
+              Start-Sleep -Seconds 5
           }
 
-          if (!$connected) {
-            throw "RDP port 3389 is not reachable."
+          if (-not $connected) {
+              throw "TCP connection to RDP port 3389 failed."
           }
 
-          Write-Host "RDP port is reachable."
+          Write-Host "TCP connectivity successful!"
 
       # ==========================================
-      # 8. DOWNLOAD PCYBER EXE FROM GITHUB
+      # 7. DOWNLOAD PCYBER APPLICATION
       # ==========================================
 
-      - name: Download PCYBER Application from GitHub Releases
-        shell: powershell
+      - name: Download PCYBER Application from GitHub
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
+          $downloadUrl = "https://github.com/pcyberict/pcyber-rdp-apps/releases/download/v1.0/pbot.exe"
           $installerPath = "$env:TEMP\pbot.exe"
 
-          Write-Host "========================================"
+          $expectedHash = "32b69e5102b90d77d521cdd8404511ad1dc031a77c450cf5c80811bc0164cee8"
+
+          Write-Host "======================================"
           Write-Host "DOWNLOADING PCYBER APPLICATION"
-          Write-Host "========================================"
           Write-Host "Source: GitHub Releases"
-          Write-Host "Downloading pbot.exe..."
+          Write-Host "======================================"
 
           Invoke-WebRequest `
-            -Uri $env:APP_URL `
+            -Uri $downloadUrl `
             -OutFile $installerPath `
             -UseBasicParsing
 
-          if (!(Test-Path $installerPath)) {
-            throw "Download failed: pbot.exe was not created."
+          if (-not (Test-Path $installerPath)) {
+              throw "pbot.exe download failed."
           }
 
           $file = Get-Item $installerPath
+          $sizeMB = [math]::Round($file.Length / 1MB, 2)
 
-          Write-Host "Downloaded size: $([math]::Round($file.Length / 1MB, 2)) MB"
+          Write-Host "Downloaded size: $sizeMB MB"
 
           if ($file.Length -lt 900MB) {
-            throw "Downloaded file is too small."
+              throw "Downloaded application is too small."
           }
 
+          # Verify Windows executable signature
           $signature = [System.IO.File]::ReadAllBytes($installerPath)[0..1]
 
           if ($signature[0] -ne 0x4D -or $signature[1] -ne 0x5A) {
-            throw "Invalid EXE file. Windows MZ signature not found."
+              throw "Invalid EXE file."
           }
 
-          $hash = (Get-FileHash -Path $installerPath -Algorithm SHA256).Hash.ToLower()
+          # Verify SHA256
+          $actualHash = (Get-FileHash `
+            -Path $installerPath `
+            -Algorithm SHA256).Hash.ToLower()
 
-          Write-Host "Downloaded SHA256: $hash"
+          Write-Host "SHA256: $actualHash"
 
-          if ($hash -ne $env:APP_SHA256) {
-            throw "SHA256 verification failed."
+          if ($actualHash -ne $expectedHash) {
+              throw "SHA256 verification failed."
           }
 
-          Write-Host "Download and integrity verification successful."
+          Write-Host "PCYBER application downloaded and verified successfully."
 
       # ==========================================
-      # 9. INSTALL PCYBER APPLICATION
+      # 8. INSTALL PCYBER APPLICATION
       # ==========================================
 
       - name: Install PCYBER Application
-        shell: powershell
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
           $installerPath = "$env:TEMP\pbot.exe"
 
-          if (!(Test-Path $installerPath)) {
-            throw "PCYBER application installer not found."
+          if (-not (Test-Path $installerPath)) {
+              throw "PCYBER installer not found."
           }
 
           Write-Host "Starting PCYBER application installer..."
 
+          # Assumes this installer supports /S for silent installation.
           $process = Start-Process `
             -FilePath $installerPath `
             -ArgumentList "/S" `
@@ -348,117 +335,115 @@ jobs:
           Write-Host "Installer exit code: $($process.ExitCode)"
 
           if ($process.ExitCode -notin @(0, 3010)) {
-            throw "PCYBER application installation failed."
+              throw "PCYBER application installation failed."
           }
 
           Write-Host "PCYBER application installation completed."
 
       # ==========================================
-      # 10. DOWNLOAD DOWNLOADS.BAT
+      # 9. MAINTAIN CONNECTION + WATCH RDP USER
       # ==========================================
 
-      - name: Download Downloads.bat and Configure Startup
-        shell: powershell
+      - name: Maintain Connection + Watch RDP User
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $profilePath = "C:\Users\$env:RDP_USERNAME"
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "           RDP ACCESS"
+          Write-Host "======================================"
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Port: 3389"
+          Write-Host "Username: RDP"
+          Write-Host "Password: Use the configured RDP password"
+          Write-Host "RAM Target: 16 GB"
+          Write-Host "Timeout: 360 minutes"
+          Write-Host "======================================"
 
-          $startupPath = Join-Path $profilePath `
-            "AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+          $rdpProfile = "C:\Users\RDP"
 
-          Write-Host "Waiting for RDP user profile..."
+          $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
 
-          for ($i = 1; $i -le 60; $i++) {
-            if (Test-Path $profilePath) {
-              break
-            }
+          $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
 
-            Start-Sleep -Seconds 5
+          $downloadPath = "$startupPath\Downloads.bat"
+
+          # Wait for RDP profile
+          while ($true) {
+
+              if (Test-Path $rdpProfile) {
+
+                  try {
+
+                      if (-not (Test-Path $startupPath)) {
+                          New-Item `
+                            -ItemType Directory `
+                            -Path $startupPath `
+                            -Force | Out-Null
+                      }
+
+                      Write-Host "Downloading Downloads.bat..."
+
+                      Invoke-WebRequest `
+                        -Uri $downloadUrl `
+                        -OutFile $downloadPath `
+                        -UseBasicParsing
+
+                      if ((Get-Item $downloadPath).Length -lt 10) {
+                          throw "Downloads.bat is empty or invalid."
+                      }
+
+                      Write-Host "Downloads.bat copied to $downloadPath"
+
+                      # Run batch file for the first time
+                      cmd.exe /c $downloadPath
+
+                      Write-Host "Downloads.bat executed."
+
+                      break
+
+                  }
+                  catch {
+                      Write-Host "Error: $($_.Exception.Message)"
+                      throw
+                  }
+
+              }
+              else {
+                  Write-Host "[$(Get-Date)] Waiting for RDP profile to be created..."
+                  Start-Sleep -Seconds 30
+              }
           }
 
-          New-Item -ItemType Directory -Path $startupPath -Force |
-            Out-Null
-
-          $batPath = Join-Path $startupPath "Downloads.bat"
-
-          Write-Host "Downloading Downloads.bat..."
-
-          Invoke-WebRequest `
-            -Uri $env:DOWNLOADS_BAT_URL `
-            -OutFile $batPath `
-            -UseBasicParsing
-
-          if (!(Test-Path $batPath)) {
-            throw "Downloads.bat download failed."
-          }
-
-          if ((Get-Item $batPath).Length -lt 10) {
-            throw "Downloads.bat appears to be empty."
-          }
-
-          Write-Host "Downloads.bat successfully placed in startup folder."
-
-      # ==========================================
-      # 11. DISPLAY CONNECTION DETAILS
-      # ==========================================
-
-      - name: Display RDP Connection Details
-        shell: powershell
-        run: |
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "          PCYBER RDP IS READY"
-          Write-Host "=============================================="
-          Write-Host ""
-          Write-Host "RDP ADDRESS : $env:TAILSCALE_IP"
-          Write-Host "RDP PORT    : 3389"
-          Write-Host "USERNAME    : RDP"
-          Write-Host "PASSWORD    : Your configured RDP_PASSWORD secret"
-          Write-Host ""
-          Write-Host "Connect using Windows Remote Desktop (mstsc.exe)."
-          Write-Host "Your client device must also be connected to Tailscale."
-          Write-Host ""
-          Write-Host "=============================================="
-
-      # ==========================================
-      # 12. KEEP RDP ALIVE
-      # ==========================================
-
-      - name: Keep RDP Runner Alive for 350 Minutes
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Continue"
-
-          Write-Host "=============================================="
-          Write-Host "PCYBER RDP SESSION IS RUNNING"
-          Write-Host "Runner: windows-2022"
-          Write-Host "Expected RAM: approximately 16 GB"
-          Write-Host "Maximum workflow timeout: 360 minutes"
-          Write-Host "=============================================="
-
+          # Keep runner alive for 350 minutes
           $startTime = Get-Date
           $endTime = $startTime.AddMinutes(350)
 
           while ((Get-Date) -lt $endTime) {
-            $elapsed = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
-            $remaining = [math]::Round(($endTime - (Get-Date)).TotalMinutes, 1)
 
-            Write-Host ""
-            Write-Host "Session elapsed: $elapsed minutes"
-            Write-Host "Session remaining: $remaining minutes"
-            Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+              Write-Host ""
+              Write-Host "[$(Get-Date)] RDP Active"
+              Write-Host "Tailscale IP: $env:TAILSCALE_IP"
 
-            $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+              # Check Tailscale
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" status |
+                Out-Null
 
-            if (Test-Path $tailscale) {
-              & $tailscale status
-            }
+              # Monitor RAM
+              $computer = Get-CimInstance Win32_ComputerSystem
+              $ramGB = [math]::Round($computer.TotalPhysicalMemory / 1GB, 2)
 
-            Write-Host "RDP service status:"
-            Get-Service TermService | Select-Object Name, Status
+              Write-Host "Available RAM: $ramGB GB"
+              Write-Host "RAM Target: 16 GB"
 
-            Start-Sleep -Seconds 300
+              $elapsed = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
+              $remaining = [math]::Round(($endTime - (Get-Date)).TotalMinutes, 1)
+
+              Write-Host "Elapsed: $elapsed minutes"
+              Write-Host "Remaining: $remaining minutes"
+
+              Start-Sleep -Seconds 300
           }
 
-          Write-Host "RDP session maintenance period completed."
+          Write-Host "RDP maintenance period completed."
