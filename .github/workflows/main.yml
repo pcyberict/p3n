@@ -10,58 +10,63 @@ jobs:
     timeout-minutes: 360
 
     steps:
+
+      # ==========================================
+      # 1. CHECK WINDOWS AND AVAILABLE RAM
+      # ==========================================
       - name: Check Windows and Available RAM
         shell: pwsh
         run: |
-          Write-Host "===== WINDOWS INFORMATION ====="
-          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture
+          Write-Host "======================================"
+          Write-Host "WINDOWS RUNNER INFORMATION"
+          Write-Host "======================================"
 
-          Write-Host "===== CPU INFORMATION ====="
-          Get-CimInstance Win32_Processor |
-            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion
 
-          Write-Host "===== RAM INFORMATION ====="
-          $computer = Get-CimInstance Win32_ComputerSystem
-          $ramGB = [math]::Round($computer.TotalPhysicalMemory / 1GB, 2)
+          $ramGB = [math]::Round(
+              (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB,
+              2
+          )
 
           Write-Host "Available RAM: $ramGB GB"
           Write-Host "Requested RAM: 16 GB"
 
-          if ($ramGB -ge 16) {
-            Write-Host "16 GB RAM requirement satisfied."
+          if ($ramGB -lt 16) {
+              Write-Warning "Runner has less than 16 GB RAM."
           }
           else {
-            Write-Warning "Runner has less than 16 GB RAM."
+              Write-Host "RAM requirement met."
           }
 
-          Write-Host "===== STORAGE ====="
-          Get-PSDrive -PSProvider FileSystem |
-            Select-Object Name,
-              @{Name="FreeGB";Expression={[math]::Round($_.Free / 1GB, 2)}}
-
+      # ==========================================
+      # 2. CONFIGURE CORE RDP SETTINGS
+      # ==========================================
       - name: Configure Core RDP Settings
         shell: pwsh
         run: |
-          # Enable Remote Desktop
+          # Enable Remote Desktop and disable Network Level Authentication
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0 -Force
-
-          # Preserve original authentication configuration
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" -Value 0 -Force
+                             -Name "fDenyTSConnections" -Value 0 -Force
 
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "SecurityLayer" -Value 0 -Force
+                             -Name "UserAuthentication" -Value 0 -Force
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
           # Remove existing firewall rule
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
 
-          # Original firewall configuration
+          # Allow incoming RDP connections
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
+          # Restart Remote Desktop service
           Restart-Service -Name TermService -Force
 
+      # ==========================================
+      # 3. CREATE RDP USER
+      # ==========================================
       - name: Create RDP User with Fixed Password
         shell: pwsh
         run: |
@@ -87,6 +92,9 @@ jobs:
 
           Write-Host "RDP user created successfully."
 
+      # ==========================================
+      # 4. INSTALL TAILSCALE
+      # ==========================================
       - name: Install Tailscale
         shell: pwsh
         run: |
@@ -95,35 +103,29 @@ jobs:
 
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
 
-          $process = Start-Process msiexec.exe `
+          Start-Process msiexec.exe `
             -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
-            -Wait -PassThru
-
-          if ($process.ExitCode -notin @(0, 3010)) {
-              throw "Tailscale installation failed."
-          }
+            -Wait
 
           Remove-Item $installerPath -Force
 
+      # ==========================================
+      # 5. ESTABLISH TAILSCALE CONNECTION
+      # ==========================================
       - name: Establish Tailscale Connection
         shell: pwsh
         run: |
+          # Connect Tailscale using GitHub secret
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
             --authkey=${{ secrets.TAILSCALE_AUTHKEY }} `
             --hostname=gh-runner-$env:GITHUB_RUN_ID
-
-          if ($LASTEXITCODE -ne 0) {
-              Write-Error "Tailscale connection failed."
-              exit 1
-          }
 
           # Wait for Tailscale IP
           $tsIP = $null
           $retries = 0
 
           while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 |
-                Select-Object -First 1).Trim()
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
 
               if (-not $tsIP) {
                   Start-Sleep -Seconds 5
@@ -139,17 +141,19 @@ jobs:
 
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
+          Write-Host "Tailscale IP: $tsIP"
+
+      # ==========================================
+      # 6. VERIFY RDP ACCESSIBILITY
+      # ==========================================
       - name: Verify RDP Accessibility
         shell: pwsh
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
 
-          Start-Sleep -Seconds 10
-
           $testResult = Test-NetConnection `
             -ComputerName $env:TAILSCALE_IP `
-            -Port 3389 `
-            -WarningAction SilentlyContinue
+            -Port 3389
 
           if (-not $testResult.TcpTestSucceeded) {
               Write-Error "TCP connection to RDP port 3389 failed"
@@ -159,67 +163,86 @@ jobs:
           Write-Host "TCP connectivity successful!"
 
       # ==========================================
-      # CUSTOM GOOGLE DRIVE APPLICATION
+      # 7. DOWNLOAD CUSTOM APPLICATION
       # ==========================================
-
-      - name: Download Custom Application from Google Drive
+      - name: Download Custom Application
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-
-          $appUrl = "https://drive.usercontent.google.com/download?id=131MEALRViQyE6f5MyasX6dj6yJnr8ib6&export=download"
-
-          $installerPath = "$env:TEMP\PCYBER-CustomApp.exe"
 
           Write-Host "======================================"
           Write-Host "DOWNLOADING CUSTOM APPLICATION"
           Write-Host "======================================"
 
-          Write-Host "Source: Google Drive"
+          $downloadUrl = "https://drive.google.com/uc?export=download&id=131MEALRViQyE6f5MyasX6dj6yJnr8ib6&confirm=t"
+
+          $installerPath = "$env:TEMP\PCYBER-CustomApp.exe"
+
+          if (Test-Path $installerPath) {
+              Remove-Item $installerPath -Force
+          }
+
+          Write-Host "Source: Google Drive direct download"
+          Write-Host "Downloading..."
 
           Invoke-WebRequest `
-            -Uri $appUrl `
+            -Uri $downloadUrl `
             -OutFile $installerPath `
+            -UseBasicParsing `
             -MaximumRedirection 10 `
-            -UseBasicParsing
+            -Headers @{
+                "User-Agent" = "Mozilla/5.0"
+            }
 
-          if (!(Test-Path $installerPath)) {
-              throw "Custom application download failed."
+          if (-not (Test-Path $installerPath)) {
+              throw "Download failed: installer file was not created."
           }
 
           $file = Get-Item $installerPath
 
-          Write-Host "Downloaded size: $([math]::Round($file.Length / 1MB, 2)) MB"
+          $sizeMB = [math]::Round($file.Length / 1MB, 2)
+
+          Write-Host "Downloaded size: $sizeMB MB"
 
           if ($file.Length -lt 100KB) {
-              throw "Downloaded file is too small. Check Google Drive sharing permissions."
+              Write-Host "Downloaded content is too small."
+
+              Get-Content $installerPath -TotalCount 10 -ErrorAction SilentlyContinue
+
+              throw "Google Drive did not return the actual EXE file. Check sharing permissions."
           }
 
-          # Verify Windows executable signature header (MZ)
+          # Verify Windows executable signature (MZ header)
           $stream = [System.IO.File]::OpenRead($installerPath)
 
           try {
               $header = New-Object byte[] 2
-              $null = $stream.Read($header, 0, 2)
+              [void]$stream.Read($header, 0, 2)
           }
           finally {
               $stream.Dispose()
           }
 
           if ($header[0] -ne 0x4D -or $header[1] -ne 0x5A) {
-              throw "Google Drive returned a non-EXE file. Check file sharing permissions or download confirmation."
+              throw "Downloaded file is not a valid Windows EXE."
           }
 
-          Write-Host "Custom application downloaded and verified."
+          Write-Host "SUCCESS: Valid EXE downloaded."
+          Write-Host "File: $installerPath"
 
+          echo "CUSTOM_APP_PATH=$installerPath" >> $env:GITHUB_ENV
+
+      # ==========================================
+      # 8. INSTALL CUSTOM APPLICATION
+      # ==========================================
       - name: Install Custom Application
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $installerPath = "$env:TEMP\PCYBER-CustomApp.exe"
+          $installerPath = $env:CUSTOM_APP_PATH
 
-          if (!(Test-Path $installerPath)) {
+          if (-not (Test-Path $installerPath)) {
               throw "Custom application installer not found."
           }
 
@@ -227,30 +250,25 @@ jobs:
           Write-Host "INSTALLING CUSTOM APPLICATION"
           Write-Host "======================================"
 
-          # Silent installation argument.
-          # Change this if your installer uses different switches.
-          $installArguments = "/S"
-
+          # /S is a common silent-install switch.
+          # Change it if your installer uses a different switch.
           $process = Start-Process `
             -FilePath $installerPath `
-            -ArgumentList $installArguments `
+            -ArgumentList "/S" `
             -Wait `
             -PassThru
 
           Write-Host "Installer exit code: $($process.ExitCode)"
 
           if ($process.ExitCode -notin @(0, 3010)) {
-              throw "Custom application installation failed. Exit code: $($process.ExitCode)"
+              throw "Custom application installation failed."
           }
 
           Write-Host "Custom application installation completed."
 
-          Remove-Item $installerPath -Force
-
       # ==========================================
-      # ORIGINAL DOWNLOADS.BAT FUNCTIONALITY
+      # 9. MAINTAIN CONNECTION + DOWNLOADS.BAT
       # ==========================================
-
       - name: Maintain Connection + Watch RDP User
         shell: pwsh
         run: |
@@ -258,9 +276,6 @@ jobs:
           Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "Username: RDP"
           Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "RAM Target: 16 GB"
-          Write-Host "Timeout: 360 minutes"
-          Write-Host "Custom Application: Installed"
           Write-Host "==================`n"
 
           $rdpProfile = "C:\Users\RDP"
@@ -271,9 +286,10 @@ jobs:
 
           $downloadPath = "$startupPath\Downloads.bat"
 
-          # Wait for RDP profile
           while ($true) {
+
               if (Test-Path $rdpProfile) {
+
                   try {
                       if (-not (Test-Path $startupPath)) {
                           New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
@@ -286,7 +302,7 @@ jobs:
 
                       Write-Host "Downloads.bat copied to $downloadPath"
 
-                      # Execute original batch file
+                      # Run the batch file for the first time
                       cmd /c $downloadPath
 
                       Write-Host "Downloads.bat executed successfully"
@@ -295,7 +311,7 @@ jobs:
                   }
                   catch {
                       Write-Host "Error copying or executing Downloads.bat: $($_.Exception.Message)"
-                      throw
+                      break
                   }
               }
               else {
@@ -309,16 +325,7 @@ jobs:
           while ($true) {
               Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
 
-              # Check Tailscale
-              & "$env:ProgramFiles\Tailscale\tailscale.exe" status | Out-Null
-
-              # Monitor RAM
-              $computer = Get-CimInstance Win32_ComputerSystem
-
-              $ramGB = [math]::Round($computer.TotalPhysicalMemory / 1GB, 2)
-
-              Write-Host "Available RAM: $ramGB GB"
-              Write-Host "RAM Target: 16 GB"
+              Write-Host "Available RAM: $([math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2)) GB"
 
               Start-Sleep -Seconds 300
           }
