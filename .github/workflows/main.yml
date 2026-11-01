@@ -44,7 +44,6 @@ jobs:
       - name: Configure Core RDP Settings
         shell: pwsh
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
 
@@ -54,14 +53,11 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
-          # Remove existing firewall rule
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
 
-          # Allow incoming RDP connections
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
-          # Restart Remote Desktop service
           Restart-Service -Name TermService -Force
 
       # ==========================================
@@ -115,12 +111,10 @@ jobs:
       - name: Establish Tailscale Connection
         shell: pwsh
         run: |
-          # Connect Tailscale using GitHub secret
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
             --authkey=${{ secrets.TAILSCALE_AUTHKEY }} `
             --hostname=gh-runner-$env:GITHUB_RUN_ID
 
-          # Wait for Tailscale IP
           $tsIP = $null
           $retries = 0
 
@@ -174,45 +168,94 @@ jobs:
           Write-Host "DOWNLOADING CUSTOM APPLICATION"
           Write-Host "======================================"
 
-          $downloadUrl = "https://drive.google.com/uc?export=download&id=131MEALRViQyE6f5MyasX6dj6yJnr8ib6&confirm=t"
-
+          $fileId = "131MEALRViQyE6f5MyasX6dj6yJnr8ib6"
           $installerPath = "$env:TEMP\PCYBER-CustomApp.exe"
 
           if (Test-Path $installerPath) {
               Remove-Item $installerPath -Force
           }
 
-          Write-Host "Source: Google Drive direct download"
-          Write-Host "Downloading..."
+          $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
 
-          Invoke-WebRequest `
-            -Uri $downloadUrl `
-            -OutFile $installerPath `
-            -UseBasicParsing `
-            -MaximumRedirection 10 `
-            -Headers @{
-                "User-Agent" = "Mozilla/5.0"
-            }
+          $headers = @{
+              "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+          }
+
+          $downloadUrl = "https://drive.google.com/uc?export=download&id=$fileId"
+
+          Write-Host "Source: Google Drive"
+          Write-Host "Requesting file..."
+
+          $response = Invoke-WebRequest `
+              -Uri $downloadUrl `
+              -WebSession $session `
+              -Headers $headers `
+              -MaximumRedirection 10 `
+              -UseBasicParsing
+
+          $contentType = $response.Headers["Content-Type"]
+
+          if ($contentType -match "text/html") {
+
+              Write-Host "Google Drive confirmation required."
+
+              $confirmToken = $null
+
+              foreach ($cookie in $session.Cookies.GetCookies([uri]"https://drive.google.com")) {
+                  if ($cookie.Name -like "download_warning*") {
+                      $confirmToken = $cookie.Value
+                      break
+                  }
+              }
+
+              if (-not $confirmToken) {
+                  if ($response.Content -match 'confirm=([0-9A-Za-z_-]+)') {
+                      $confirmToken = $Matches[1]
+                  }
+              }
+
+              if (-not $confirmToken -and $response.Content -match 'name="confirm"\s+value="([^"]+)"') {
+                  $confirmToken = $Matches[1]
+              }
+
+              if (-not $confirmToken) {
+                  throw "Could not extract Google Drive confirmation token. File may have a quota or access restriction."
+              }
+
+              Write-Host "Confirmation token received."
+              Write-Host "Requesting actual file..."
+
+              $downloadUrl = "https://drive.google.com/uc?export=download&id=$fileId&confirm=$confirmToken"
+
+              Invoke-WebRequest `
+                  -Uri $downloadUrl `
+                  -OutFile $installerPath `
+                  -WebSession $session `
+                  -Headers $headers `
+                  -MaximumRedirection 10 `
+                  -UseBasicParsing
+          }
+          else {
+              [System.IO.File]::WriteAllBytes(
+                  $installerPath,
+                  $response.Content
+              )
+          }
 
           if (-not (Test-Path $installerPath)) {
-              throw "Download failed: installer file was not created."
+              throw "Download failed. Installer file was not created."
           }
 
           $file = Get-Item $installerPath
-
           $sizeMB = [math]::Round($file.Length / 1MB, 2)
 
           Write-Host "Downloaded size: $sizeMB MB"
 
           if ($file.Length -lt 100KB) {
-              Write-Host "Downloaded content is too small."
-
-              Get-Content $installerPath -TotalCount 10 -ErrorAction SilentlyContinue
-
-              throw "Google Drive did not return the actual EXE file. Check sharing permissions."
+              throw "Downloaded file is too small. Google Drive may be blocking access or enforcing a download quota."
           }
 
-          # Verify Windows executable signature (MZ header)
+          # Verify Windows executable header
           $stream = [System.IO.File]::OpenRead($installerPath)
 
           try {
@@ -224,11 +267,11 @@ jobs:
           }
 
           if ($header[0] -ne 0x4D -or $header[1] -ne 0x5A) {
-              throw "Downloaded file is not a valid Windows EXE."
+              throw "Downloaded content is not a valid Windows EXE."
           }
 
-          Write-Host "SUCCESS: Valid EXE downloaded."
-          Write-Host "File: $installerPath"
+          Write-Host "SUCCESS: Valid Windows EXE downloaded."
+          Write-Host "Location: $installerPath"
 
           echo "CUSTOM_APP_PATH=$installerPath" >> $env:GITHUB_ENV
 
@@ -250,8 +293,7 @@ jobs:
           Write-Host "INSTALLING CUSTOM APPLICATION"
           Write-Host "======================================"
 
-          # /S is a common silent-install switch.
-          # Change it if your installer uses a different switch.
+          # Common silent installation switch
           $process = Start-Process `
             -FilePath $installerPath `
             -ArgumentList "/S" `
@@ -302,7 +344,6 @@ jobs:
 
                       Write-Host "Downloads.bat copied to $downloadPath"
 
-                      # Run the batch file for the first time
                       cmd /c $downloadPath
 
                       Write-Host "Downloads.bat executed successfully"
@@ -325,7 +366,12 @@ jobs:
           while ($true) {
               Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
 
-              Write-Host "Available RAM: $([math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2)) GB"
+              $ramGB = [math]::Round(
+                  (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB,
+                  2
+              )
+
+              Write-Host "Available RAM: $ramGB GB"
 
               Start-Sleep -Seconds 300
           }
