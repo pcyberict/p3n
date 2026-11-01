@@ -1,5 +1,5 @@
 
-name: win 11 + tailscale + Download.bat script
+name: win 11 + tailscale + Custom App + Download.bat script
 
 on:
   workflow_dispatch:
@@ -25,14 +25,13 @@ jobs:
           $ramGB = [math]::Round($computer.TotalPhysicalMemory / 1GB, 2)
 
           Write-Host "Available RAM: $ramGB GB"
-          Write-Host "Requested RAM: 128 GB"
+          Write-Host "Requested RAM: 16 GB"
 
-          if ($ramGB -ge 128) {
-            Write-Host "128 GB RAM requirement satisfied."
+          if ($ramGB -ge 16) {
+            Write-Host "16 GB RAM requirement satisfied."
           }
           else {
-            Write-Host "WARNING: This runner does not have 128 GB RAM."
-            Write-Host "Actual available RAM: $ramGB GB"
+            Write-Warning "Runner has less than 16 GB RAM."
           }
 
           Write-Host "===== STORAGE ====="
@@ -43,20 +42,21 @@ jobs:
       - name: Configure Core RDP Settings
         shell: pwsh
         run: |
-          # Enable Remote Desktop and preserve original authentication settings
+          # Enable Remote Desktop
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
+            -Name "fDenyTSConnections" -Value 0 -Force
+
+          # Preserve original authentication configuration
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
 
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+            -Name "SecurityLayer" -Value 0 -Force
 
           # Remove existing firewall rule
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
 
-          # Preserve original firewall configuration
+          # Original firewall configuration
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
@@ -108,7 +108,6 @@ jobs:
       - name: Establish Tailscale Connection
         shell: pwsh
         run: |
-          # Connect Tailscale with the original authentication key
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
             --authkey=${{ secrets.TAILSCALE_AUTHKEY }} `
             --hostname=gh-runner-$env:GITHUB_RUN_ID
@@ -123,7 +122,8 @@ jobs:
           $retries = 0
 
           while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 | Select-Object -First 1).Trim()
+              $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 |
+                Select-Object -First 1).Trim()
 
               if (-not $tsIP) {
                   Start-Sleep -Seconds 5
@@ -144,7 +144,6 @@ jobs:
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
 
-          # Allow time for network configuration
           Start-Sleep -Seconds 10
 
           $testResult = Test-NetConnection `
@@ -159,6 +158,99 @@ jobs:
 
           Write-Host "TCP connectivity successful!"
 
+      # ==========================================
+      # CUSTOM GOOGLE DRIVE APPLICATION
+      # ==========================================
+
+      - name: Download Custom Application from Google Drive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $appUrl = "https://drive.usercontent.google.com/download?id=131MEALRViQyE6f5MyasX6dj6yJnr8ib6&export=download"
+
+          $installerPath = "$env:TEMP\PCYBER-CustomApp.exe"
+
+          Write-Host "======================================"
+          Write-Host "DOWNLOADING CUSTOM APPLICATION"
+          Write-Host "======================================"
+
+          Write-Host "Source: Google Drive"
+
+          Invoke-WebRequest `
+            -Uri $appUrl `
+            -OutFile $installerPath `
+            -MaximumRedirection 10 `
+            -UseBasicParsing
+
+          if (!(Test-Path $installerPath)) {
+              throw "Custom application download failed."
+          }
+
+          $file = Get-Item $installerPath
+
+          Write-Host "Downloaded size: $([math]::Round($file.Length / 1MB, 2)) MB"
+
+          if ($file.Length -lt 100KB) {
+              throw "Downloaded file is too small. Check Google Drive sharing permissions."
+          }
+
+          # Verify Windows executable signature header (MZ)
+          $stream = [System.IO.File]::OpenRead($installerPath)
+
+          try {
+              $header = New-Object byte[] 2
+              $null = $stream.Read($header, 0, 2)
+          }
+          finally {
+              $stream.Dispose()
+          }
+
+          if ($header[0] -ne 0x4D -or $header[1] -ne 0x5A) {
+              throw "Google Drive returned a non-EXE file. Check file sharing permissions or download confirmation."
+          }
+
+          Write-Host "Custom application downloaded and verified."
+
+      - name: Install Custom Application
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installerPath = "$env:TEMP\PCYBER-CustomApp.exe"
+
+          if (!(Test-Path $installerPath)) {
+              throw "Custom application installer not found."
+          }
+
+          Write-Host "======================================"
+          Write-Host "INSTALLING CUSTOM APPLICATION"
+          Write-Host "======================================"
+
+          # Silent installation argument.
+          # Change this if your installer uses different switches.
+          $installArguments = "/S"
+
+          $process = Start-Process `
+            -FilePath $installerPath `
+            -ArgumentList $installArguments `
+            -Wait `
+            -PassThru
+
+          Write-Host "Installer exit code: $($process.ExitCode)"
+
+          if ($process.ExitCode -notin @(0, 3010)) {
+              throw "Custom application installation failed. Exit code: $($process.ExitCode)"
+          }
+
+          Write-Host "Custom application installation completed."
+
+          Remove-Item $installerPath -Force
+
+      # ==========================================
+      # ORIGINAL DOWNLOADS.BAT FUNCTIONALITY
+      # ==========================================
+
       - name: Maintain Connection + Watch RDP User
         shell: pwsh
         run: |
@@ -166,12 +258,17 @@ jobs:
           Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "Username: RDP"
           Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "RAM Target: 16 GB"
+          Write-Host "Timeout: 360 minutes"
+          Write-Host "Custom Application: Installed"
           Write-Host "==================`n"
 
           $rdpProfile = "C:\Users\RDP"
+
           $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
 
           $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
+
           $downloadPath = "$startupPath\Downloads.bat"
 
           # Wait for RDP profile
@@ -189,10 +286,11 @@ jobs:
 
                       Write-Host "Downloads.bat copied to $downloadPath"
 
-                      # Run the batch file for the first time
+                      # Execute original batch file
                       cmd /c $downloadPath
 
                       Write-Host "Downloads.bat executed successfully"
+
                       break
                   }
                   catch {
@@ -202,6 +300,7 @@ jobs:
               }
               else {
                   Write-Host "[$(Get-Date)] Waiting for RDP profile to be created..."
+
                   Start-Sleep -Seconds 30
               }
           }
@@ -210,14 +309,16 @@ jobs:
           while ($true) {
               Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
 
-              # Keep Tailscale connected
+              # Check Tailscale
               & "$env:ProgramFiles\Tailscale\tailscale.exe" status | Out-Null
 
               # Monitor RAM
               $computer = Get-CimInstance Win32_ComputerSystem
+
               $ramGB = [math]::Round($computer.TotalPhysicalMemory / 1GB, 2)
 
               Write-Host "Available RAM: $ramGB GB"
+              Write-Host "RAM Target: 16 GB"
 
               Start-Sleep -Seconds 300
           }
