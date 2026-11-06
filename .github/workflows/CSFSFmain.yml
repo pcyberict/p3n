@@ -1,5 +1,5 @@
 
-name: win 11 + tailscale + Download.bat script
+name: pc
 
 on:
   workflow_dispatch:
